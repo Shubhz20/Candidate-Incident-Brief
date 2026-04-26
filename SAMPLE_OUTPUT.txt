@@ -1,0 +1,135 @@
+==============================================================================
+INCIDENT RESPONSE REPORT — INC-2026-04-26-001
+==============================================================================
+
+Title:    Mitigate SQLAlchemy QueuePool exhaustion (suspected session leak in deploy 2026.03.17-2) causing 504/502 across login, portfolio, watchlist, orders, rebalance, recommendations
+Severity: SEV2
+Endpoints: /api/v1/auth/login, /api/v1/portfolio/summary, /api/v1/watchlist, /api/v1/orders, /api/v1/orders/rebalance, /api/v1/recommendations
+
+--- Diagnosis (Agent 1) ---
+Primary cause:    Database connection pool exhaustion in the API app tier (SQLAlchemy QueuePool size=20 + overflow=5 fully checked out, ~57 waiters), driven by a session leak introduced in deploy 2026.03.17-2 to portfolio/rebalance_service.py:118. The starved pool causes 30s pool_timeout failures and gunicorn worker timeouts, which Nginx surfaces as 504/502 on /api/v1/auth/login, /api/v1/portfolio/summary, /api/v1/watchlist, /api/v1/orders, /api/v1/orders/rebalance and /api/v1/recommendations.
+Secondary causes:
+  - All gunicorn workers temporarily down (no listener on :8000)
+  - Postgres max_connections also saturated at the DB tier
+  - Suspected session leak in portfolio/rebalance_service.py:118
+  - Gunicorn workers killed while blocked on DB → premature 502s
+  - Recent deploy 2026.03.17-2 modified rebalance DB session lifecycle — strong correlation with leak onset
+Confidence:       0.90
+Error signatures:
+  - nginx upstream timed out (110: Connection timed out)
+  - nginx upstream prematurely closed connection (502)
+  - nginx connect() failed (111: Connection refused)
+  - SQLAlchemy QueuePool limit reached (sqlalchemy.exc.TimeoutError)
+  - PostgreSQL: remaining connection slots are reserved (psycopg2.OperationalError)
+  - SQLAlchemy session leak (session close skipped)
+  - gunicorn Worker timeout
+Evidence:
+  [nginx-error.log] 2026/03/17 11:41:04 [error] 18420#18420: *8821 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 103.87.44.9, server: api.example.internal, request: "GET /api/v1/portfolio/summary HTTP/1.1", upstream: "http://127.0.0.1:8000/api/v1/portfolio/summary", host: "api.example.com", referrer: "https://client.example.com/dashboard"
+     why: Nginx is hitting proxy_read_timeout because the upstream app server never returned a response — classic symptom of a stalled backend, not a network failure.
+  [nginx-error.log] 2026/03/17 11:41:12 [error] 18420#18420: *8832 upstream prematurely closed connection while reading response header from upstream, client: 49.36.201.14, server: api.example.internal, request: "GET /api/v1/watchlist HTTP/1.1", upstream: "http://127.0.0.1:8000/api/v1/watchlist", host: "api.example.com", referrer: "https://client.example.com/dashboard"
+     why: Worker died mid-request — matches gunicorn 'Worker timeout / Worker exiting' lines and produces 502s on the edge.
+  [app-error.log] 2026-03-17 11:41:02,902 ERROR [sqlalchemy.pool.impl.QueuePool] QueuePool limit of size 20 overflow 5 reached, connection timed out, timeout 30.00
+     why: App pool (size=20, max_overflow=5) is fully checked out and callers wait the full 30s pool_timeout before failing — this directly produces the 60s Nginx upstream timeouts.
+  [app-error.log] 2026-03-17 11:41:05,118 ERROR [api.db] psycopg2.OperationalError: FATAL: remaining connection slots are reserved for non-replication superuser connections
+     why: Even if the app pool grew, Postgres itself is refusing new connections — saturation is end-to-end.
+  [app-error.log] 2026-03-17 11:41:17,071 WARN  [api.db] suspected session leak count=23 release_rate_below_threshold=true
+     why: Sessions checked out but not returned — the underlying cause of pool exhaustion, not just a symptom.
+
+Summary: Pool went from healthy → 'usage high' (checked_out=18) → fully exhausted (checked_out=25, waiters=57) within ~3 minutes after rebalance traffic ramped on the new deploy. SQLAlchemy raises QueuePool TimeoutError after 30s; gunicorn workers exceed their request timeout and are killed, leaving Nginx to emit 502 ('upstream prematurely closed connection') and 504 ('upstream timed out (110)'). Postgres itself reports 'remaining connection slots are reserved', confirming the saturation is end-to-end. /health continues to return 200 because it does not hit the database — so an LB-level health check would NOT have caught this.
+
+--- References (Agent 2) ---
+  [official-doc] Nginx ngx_http_proxy_module — proxy_read_timeout / proxy_connect_timeout
+     https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_read_timeout
+     relevance: Defines the directives that produce '110: Connection timed out' and how to tune them.
+  [official-doc] Nginx Admin Guide — Debugging upstream errors
+     https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/
+     relevance: Reverse-proxy troubleshooting including connect()/refused errors.
+  [official-doc] SQLAlchemy — QueuePool API (pool_size, max_overflow, pool_timeout)
+     https://docs.sqlalchemy.org/en/20/core/pooling.html#sqlalchemy.pool.QueuePool
+     relevance: Defines exactly the 'QueuePool limit of size N overflow M reached' error and the knobs that drive it.
+  [official-doc] SQLAlchemy — Session Basics (lifecycle, closing, context-manager use)
+     https://docs.sqlalchemy.org/en/20/orm/session_basics.html
+     relevance: Authoritative reference for correct session lifecycle to fix leaks.
+  [official-doc] psycopg2 — Connection class & error mapping
+     https://www.psycopg.org/docs/connection.html
+     relevance: Documents the exact OperationalError surfaced when Postgres rejects new connections.
+  [official-doc] Gunicorn — Settings (timeout, workers, worker_class)
+     https://docs.gunicorn.org/en/stable/settings.html#timeout
+     relevance: Worker timeout produces the 'Worker timeout (pid: ...)' log lines observed when DB calls block too long.
+  [official-doc] PostgreSQL — Connections and Authentication (max_connections)
+     https://www.postgresql.org/docs/current/runtime-config-connection.html
+     relevance: Defines max_connections and the 'too many clients already' error.
+  [official-doc] PgBouncer — Lightweight connection pooler for PostgreSQL
+     https://www.pgbouncer.org/usage.html
+     relevance: Standard production remedy when an app-side pool overruns Postgres.
+Research notes: Matched 8 reference(s) for signatures: ['nginx upstream timed out (110: Connection timed out)', 'nginx upstream prematurely closed connection (502)', 'nginx connect() failed (111: Connection refused)', 'SQLAlchemy QueuePool limit reached (sqlalchemy.exc.TimeoutError)', 'PostgreSQL: remaining connection slots are reserved (psycopg2.OperationalError)', 'SQLAlchemy session leak (session close skipped)', 'gunicorn Worker timeout']. Web augmentation disabled by caller.
+
+--- Playbook (Agent 3) ---
+
+  PRE-CHECKS:
+    1. Reproduce the symptom from outside the cluster
+       $ curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' https://api.example.com/api/v1/portfolio/summary
+       expected: HTTP 504 (or 502) with rt close to proxy_read_timeout (~60s)
+    2. Confirm /health stays green (rules out total outage; confirms DB-only path)
+       $ curl -sS -o /dev/null -w '%{http_code}\n' https://api.example.com/health
+       expected: HTTP 200 — confirms ingress, gunicorn, and uvicorn are alive
+    3. Verify SQLAlchemy QueuePool is saturated
+       $ kubectl logs deploy/api --tail=500 | grep -E 'QueuePool|checked_out|waiters'
+       expected: checked_out=25 (size=20+overflow=5), waiters > 0, TimeoutError after 30.00s
+    4. Verify Postgres-side saturation
+       $ psql -h $PGHOST -U $PGUSER -c "SELECT count(*) FROM pg_stat_activity; SHOW max_connections;"
+       expected: count(*) at or near max_connections; OperationalError 'remaining connection slots are reserved' visible
+    5. Identify long-held / leaking sessions and the queries they hold
+       $ psql -c "SELECT pid, application_name, state, now()-state_change AS idle_for, query FROM pg_stat_activity WHERE state IN ('idle in transaction','active') ORDER BY idle_for DESC LIMIT 20;"
+       expected: Multiple 'idle in transaction' rows from the API, concentrated on rebalance-related queries
+    6. Correlate with the most recent deploy
+       $ kubectl rollout history deploy/api | head && git log --oneline -- app/services/portfolio/rebalance_service.py | head
+       expected: Deploy 2026.03.17-2 (~11:34 IST) precedes the spike by a few minutes — strong leak suspect
+
+  REMEDIATION:
+    1. MITIGATE FIRST: roll back the API to the deploy preceding 2026.03.17-2
+       $ kubectl rollout undo deploy/api && kubectl rollout status deploy/api --timeout=180s
+       expected: Pods return to last-known-good revision; pool stats normalize within ~2 min
+    2. Terminate stuck Postgres backends still held by old workers
+       $ psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='api' AND state='idle in transaction' AND now()-state_change > interval '60 seconds';"
+       expected: Stuck connections released; Postgres backend count drops
+    3. If rollback isn't possible, raise pool capacity as a holding action only
+       $ kubectl set env deploy/api DB_POOL_SIZE=40 DB_MAX_OVERFLOW=10 DB_POOL_TIMEOUT=10 && kubectl rollout status deploy/api
+       expected: Pool grows; do NOT leave permanently — root cause is the leak
+    4. Stand up PgBouncer (transaction pooling) so app pool growth doesn't saturate Postgres
+       $ kubectl apply -f infra/pgbouncer.yaml && kubectl set env deploy/api DB_HOST=pgbouncer DB_PORT=6432
+       expected: API connects via PgBouncer; Postgres connection count drops to a small steady-state
+    5. Patch the leak: ensure SessionLocal() is always used as a context manager (or wrapped in try/finally with session.close()) in rebalance_service.py:118
+       $ git revert <sha-of-2026.03.17-2-rebalance-change>  # or land a forward-fix PR enforcing `with SessionLocal() as s:`
+       expected: No more 'session close skipped' or 'suspected session leak' warnings under load
+    6. Harden pool against half-dead connections
+       $ Set engine kwargs: pool_pre_ping=True, pool_recycle=1800, pool_timeout=10
+       expected: Stale connections recycled silently; faster fail-fast on pool starvation reduces gunicorn worker timeouts
+
+  POST-CHECKS:
+    1. All affected endpoints return 200 with healthy latency
+       $ for p in /api/v1/auth/login /api/v1/portfolio/summary /api/v1/watchlist /api/v1/orders /api/v1/recommendations; do curl -sS -o /dev/null -w "$p %{http_code} %{time_total}\n" https://api.example.com$p; done
+       expected: All HTTP 200; p95 latency < 1s
+    2. QueuePool stable for 10 minutes
+       $ kubectl logs deploy/api --since=10m | grep -E 'QueuePool|checked_out' | tail -20
+       expected: No 'usage high' or 'pool exhausted'; checked_out steady well below pool_size
+    3. No upstream errors in Nginx
+       $ tail -n 500 /var/log/nginx/error.log | grep -E 'upstream timed out|upstream prematurely closed|connect\(\) failed' || echo OK
+       expected: No matches for the last 10 minutes
+    4. Postgres connection count back to baseline
+       $ psql -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='api';"
+       expected: Steady-state count well below max_connections
+
+  ROLLBACK:
+    1. If the rollback to the previous API revision causes regressions, redeploy 2026.03.17-2 and keep the enlarged pool + PgBouncer in place while the leak fix is prepared
+       $ kubectl rollout history deploy/api && kubectl rollout undo deploy/api --to-revision=<2026.03.17-2>
+       expected: Previous behavior restored; mitigations remain active
+    2. Tear down PgBouncer if it introduces transaction-mode incompatibilities (prepared statements, SET LOCAL, etc.)
+       $ kubectl set env deploy/api DB_HOST=postgres-primary DB_PORT=5432 && kubectl delete -f infra/pgbouncer.yaml
+       expected: API connects directly to Postgres again
+    3. Revert pool size override once the leak fix is verified
+       $ kubectl set env deploy/api DB_POOL_SIZE- DB_MAX_OVERFLOW- DB_POOL_TIMEOUT- && kubectl rollout status deploy/api
+       expected: Pool returns to baseline config; no regression
+
+Notes: Deterministic fallback playbook. The leading hypothesis is a session leak introduced by deploy 2026.03.17-2 in portfolio/rebalance_service.py:118; rolling that back is the single highest-leverage mitigation. References used: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_read_timeout, https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/, https://docs.sqlalchemy.org/en/20/core/pooling.html#sqlalchemy.pool.QueuePool, https://docs.sqlalchemy.org/en/20/orm/session_basics.html, https://www.psycopg.org/docs/connection.html, https://docs.gunicorn.org/en/stable/settings.html#timeout, https://www.postgresql.org/docs/current/runtime-config-connection.html, https://www.pgbouncer.org/usage.html
+==============================================================================
